@@ -8,4 +8,4 @@
 erl_crash.dump
 rebar.lock
 xtest/releases
-xtest/testapp-*/ebin
+xtest/testapp-*/_build
