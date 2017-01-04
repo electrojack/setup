@@ -64,6 +64,46 @@
 %% * ``'{'$string', Var}''' - Use the string representation of the value
 %% * ``'{'$binary', Var}''' - Use the binary representation of the value.
 %%
+%% Example:
+%% <pre lang="erlang">
+%% 2> application:set_env(setup, vars, [{"PLUS", {apply,erlang,'+',[1,2]}},
+%% 2>                                   {"FOO", {value, {foo,1}}}]).
+%% ok
+%% 3> application:set_env(stdlib, '$setup_vars',
+%% 3>                     [{"MINUS", {apply,erlang,'-',[4,3]}},
+%% 3>                      {"BAR", {value, "bar"}}]).
+%% ok
+%% 4> application:set_env(setup, v1, "/$BAR/$PLUS/$MINUS/$FOO").
+%% ok
+%% 5> setup:get_env(setup,v1).
+%% {ok,"/$BAR/3/$MINUS/{foo,1}"}
+%% 6> application:set_env(stdlib, v1, "/$BAR/$PLUS/$MINUS/$FOO").
+%% ok
+%% 7> setup:get_env(stdlib,v1).
+%% {ok,"/bar/3/1/{foo,1}"}
+%% </pre>
+%%
+%% In the above example, the first expansion (command no. 5), leaves `$BAR'
+%% and `$MINUS' unexpanded, since they are defined in the `stdlib' application,
+%% and thus not known to `setup'. In command no. 6, however, they <em>are</em>
+%% in context, and are expanded. The variables `$PLUS' and `$FOO' have global
+%% context and are expanded in both cases.
+%%
+%% It is also possible to refer to environment variables in the same
+%% application. These are referenced as `"$env(VarName)"'. The corresponding
+%% values are expanded in turn - take care not to create expansion loops!
+%% The same rules for expansion as above apply.
+%%
+%% Example:
+%% <pre lang="erlang">
+%% 2> application:set_env(setup,foo,"foo").
+%% ok
+%% 3> application:set_env(setup,foo_dir,"$HOME/$env(foo)").
+%% ok
+%% 4> setup:get_env(setup,foo_dir).
+%% {ok,"/Users/uwiger/git/setup/foo"}
+%% </pre>
+%%
 %% == Customizing setup ==
 %% The following environment variables can be used to customize `setup':
 %% * `{home, Dir}' - The topmost directory of the running system. This should
@@ -73,6 +113,10 @@
 %% * `{log_dir, Dir}' - A directory for logging. Default is `Home/log.Node'.
 %% * `{stop_when_done, true|false}' - When invoking `setup' for an install,
 %%    `setup' normally remains running, allowing for other operations to be
+%% * `{stop_delay, Millisecs}' - If `stop_when_done' is true, and the node
+%%    is going to shut down, setup will first wait for a specified number of
+%%    milliseconds (default: 5000). This can be useful in order to allow
+%%    asynchronous operations to complete before shutting down.
 %%    performed from the shell or otherwise. If `{stop_when_done, true}', the
 %%    node is shut down once `setup' is finished.
 %% * `{abort_on_error, true|false}' - When running install or upgrade hooks,
@@ -81,16 +125,22 @@
 %%    `setup' will raise an exception if an error occurs.
 %% * `{mode, atom()}' - Specifies the context for running 'setup'. Default is
 %%   `normal'. The `setup' mode has special significance, since it's the default
-%%    mode for setup hooks, if no other mode is specified. In theory, one may
+%%    mode for setup hooks, if no other mode is specified and the node has been
+%%    started with the setup-generated `install.boot' script. In theory, one may
 %%    specify any atom value, but it's probably wise to stick to the values
 %%    'normal', 'setup' and 'upgrade' as global contexts, and instead trigger
 %%    other mode hooks by explicitly calling {@link run_hooks/1}.
+%% * `{verify_directories, boolean()}' - At startup, setup will normally ensure that
+%%    the directories used by setup actually exist. This behavior can be disabled through
+%%    the environment variable `{verify_directories, false}'. This can be desirable
+%%    if setup is used mainly e.g. for environment variable expansion, but not for
+%%    disk storage.
+%% * `{run_timeout, Millisecs}' - Set a time limit for how long it may take for
+%%    setup to process the setup hooks. Default is `infinity'. If the timeout
+%%    is exceeded, the application start sequence will be aborted, which will
+%%    cause a (rather inelegant) boot sequence failure.
 %% @end
 -module(setup).
--behaviour(application).
-
--export([start/2,
-         stop/1]).
 
 -export([home/0,
          log_dir/0,
@@ -109,12 +159,13 @@
          pick_vsn/3,
          reload_app/1, reload_app/2, reload_app/3,
          lib_dirs/0, lib_dirs/1]).
--export([read_config_script/3]).
+-export([read_config_script/3,   % (Name, F, Opts)
+         read_config_script/4]). % (Name, F, Vars, Opts)
 
 -export([ok/1]).
 -compile(export_all).
 
--export([run_setup/2]).
+-export([run_setup/0]).
 
 -include_lib("kernel/include/file.hrl").
 
@@ -122,19 +173,11 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
-%% @spec start(Type, Args) -> {ok, pid()}
-%% @doc Application start function.
-%% @end
-%%
-start(_, Args) ->
-    proc_lib:start_link(?MODULE, run_setup, [self(), Args]).
-
-%% @spec stop(State) -> ok
-%% @doc Application stop function
-%% end
-%%
-stop(_) ->
-    ok.
+-define(if_verbose(Expr),
+        case get(verbose) of
+            true -> Expr;
+            _    -> ok
+        end).
 
 %% @spec home() -> Directory
 %% @doc Returns the configured `home' directory, or a best guess (`$CWD')
@@ -178,6 +221,14 @@ setup_dir(Key, Default) ->
             D
     end.
 
+maybe_verify_directories() ->
+    case get_env(setup, verify_directories, true) of
+        true ->
+            verify_directories();
+        false ->
+            ok
+    end.
+
 %% @spec verify_directories() -> ok
 %% @doc Ensures that essential directories exist and are writable.
 %% Currently, the directories corresponding to {@link home/0},
@@ -217,7 +268,7 @@ find_env_vars(Env) ->
               case app_get_env(A, Env) of
                   {ok, Val} when Val =/= undefined ->
                       NewEnv = private_env(A, GEnv),
-                      [{A, expand_env(NewEnv, Val)}];
+                      [{A, expand_env(NewEnv, Val, A)}];
                   _ ->
                       []
               end
@@ -247,7 +298,7 @@ get_env(A, Key, Default) ->
 %% @end
 get_all_env(A) ->
     Vars = private_env(A),
-    [{K, expand_env(Vars, V)} ||
+    [{K, expand_env(Vars, V, A)} ||
         {K, V} <- application:get_all_env(A)].
 
 -spec expand_value(atom(), any()) -> any().
@@ -257,7 +308,7 @@ get_all_env(A) ->
 %% {@section Variable expansion}.
 %% @end
 expand_value(App, Value) ->
-    expand_env(private_env(App), Value).
+    expand_env(private_env(App), Value, App).
 
 global_env()  ->
     Acc = [{K, fun() -> env_value(K) end} ||
@@ -265,7 +316,9 @@ global_env()  ->
     custom_global_env(Acc).
 
 custom_global_env(Acc) ->
-    lists:foldl(fun custom_env1/2, Acc,
+    lists:foldl(fun(E, Acc1) ->
+                        custom_env1(E, Acc1, setup)
+                end, Acc,
                 [{K,V} || {K,V} <- app_get_env(setup, vars, []),
                           is_list(K)]).
 
@@ -278,7 +331,9 @@ private_env(A, GEnv) ->
     custom_private_env(A, Acc ++ GEnv).
 
 custom_private_env(A, Acc) ->
-    lists:foldl(fun custom_env1/2, Acc, 
+    lists:foldl(fun(E, Acc1) ->
+                        custom_env1(E, Acc1, A)
+                end, Acc,
                 [{K, V} ||
                     {K,V} <- app_get_env(A, '$setup_vars', []),
                     is_list(K)]).
@@ -300,37 +355,121 @@ app_get_env(A, K, Default) ->
 app_get_key(A, K) ->
     application:get_key(A, K).
 
-custom_env1({K, V}, Acc) ->
-    [{K, fun() -> custom_env_value(K, V, Acc) end} | Acc].
+custom_env1({K, V}, Acc, A) ->
+    [{K, fun() -> custom_env_value(K, V, Acc, A) end} | Acc].
 
-expand_env(Vs, {T,"$" ++ S}) when T=='$value'; T=='$string'; T=='$binary' ->
+expand_env(_, {T,"$env(" ++ S} = X, A)
+  when T=='$value'; T=='$string'; T=='$binary' ->
+    try Res = case get_env_name_l(S) of
+                  false -> undefined;
+                  {Name,[]} -> app_get_env(A, Name)
+              end,
+         case {Res, T} of
+             {undefined, '$value'} -> undefined;
+             {undefined, '$string'} -> "";
+             {undefined, '$binary'} -> <<>>;
+             {{ok,V}   , '$value'} -> V;
+             {{ok,V}   , '$string'} -> binary_to_list(stringify(V));
+             {{ok,V}   , '$binary'} -> stringify(V)
+         end
+    catch
+        error:_ -> X
+    end;
+expand_env(Vs, {T,"$" ++ S}, _) when T=='$value'; T=='$string'; T=='$binary' ->
     case {lists:keyfind(S, 1, Vs), T} of
         {false, '$value'}  -> undefined;
         {false, '$string'} -> "";
-        {false, '$binary'} -> <<"">>;
+        {false, '$binary'} -> <<>>;
         {{_,V}, '$value'}  -> V();
         {{_,V}, '$string'} -> binary_to_list(stringify(V()));
         {{_,V}, '$binary'} -> stringify(V())
     end;
-expand_env(Vs, T) when is_tuple(T) ->
-    list_to_tuple([expand_env(Vs, X) || X <- tuple_to_list(T)]);
-expand_env(Vs, L) when is_list(L) ->
+expand_env(Vs, T, A) when is_tuple(T) ->
+    list_to_tuple([expand_env(Vs, X, A) || X <- tuple_to_list(T)]);
+expand_env(Vs, L, A) when is_list(L) ->
     case setup_lib:is_string(L) of
         true ->
-            do_expand_env(L, Vs, list);
+            do_expand_env(L, Vs, A, list);
         false ->
-            [expand_env(Vs, X) || X <- L]
+            [expand_env(Vs, X, A) || X <- L]
     end;
-expand_env(Vs, B) when is_binary(B) ->
-    do_expand_env(B, Vs, binary);
-expand_env(_, X) ->
+expand_env(Vs, B, A) when is_binary(B) ->
+    do_expand_env(B, Vs, A, binary);
+expand_env(_, X, _) ->
     X.
 
-do_expand_env(X, Vs, Type) ->
-    lists:foldl(fun({K, Val}, Xx) ->
-                        re:replace(Xx, [$\\, $$ | K],
-                                   stringify(Val()), [{return,Type}])
-                end, X, Vs).
+%% do_expand_env(X, Vs, Type) ->
+%%     lists:foldl(fun({K, Val}, Xx) ->
+%%                         re:replace(Xx, [$\\, $$ | K],
+%%                                    stringify(Val()), [{return,Type}])
+%%                 end, X, Vs).
+
+do_expand_env(X, Vs, A, binary) ->
+    do_expand_env_b(iolist_to_binary(X), Vs, A);
+do_expand_env(X, Vs, A, list) ->
+    binary_to_list(do_expand_env_b(iolist_to_binary(X), Vs, A)).
+
+do_expand_env_b(<<"$env(", T/binary>>, Vs, A) ->
+    case get_env_name_b(T) of
+        {K, T1} ->
+            case app_get_env(A, K) of
+                {ok, V} ->
+                    Res = expand_env(Vs, V, A),
+                    <<(stringify(Res))/binary,
+                      (do_expand_env_b(T1, Vs, A))/binary>>;
+                undefined ->
+                    <<"$env(", (do_expand_env_b(T, Vs, A))/binary>>
+            end;
+        false ->
+            do_expand_env_b(T, Vs, A)
+    end;
+do_expand_env_b(<<"$", T/binary>>, Vs, A) ->
+    case match_var_b(Vs, T) of
+        {Res, T1} ->
+            <<Res/binary, (do_expand_env_b(T1, Vs, A))/binary>>;
+        false ->
+            <<"$", (do_expand_env_b(T, Vs, A))/binary>>
+    end;
+do_expand_env_b(<<H, T/binary>>, Vs, A) ->
+    <<H, (do_expand_env_b(T, Vs, A))/binary>>;
+do_expand_env_b(<<>>, _, _) ->
+    <<>>.
+
+get_env_name_b(B) ->
+    get_env_name_b(B, <<>>).
+
+get_env_name_b(<<")", T/binary>>, Acc) ->
+    try {binary_to_existing_atom(Acc, latin1), T}
+    catch
+        error:_ -> false
+    end;
+get_env_name_b(<<H, T/binary>>, Acc) ->
+    get_env_name_b(T, <<Acc/binary, H>>);
+get_env_name_b(<<>>, _) ->
+    false.
+
+get_env_name_l(L) ->
+    get_env_name_l(L, []).
+
+get_env_name_l(")" ++ T, Acc) ->
+    try {list_to_existing_atom(lists:reverse(Acc)), T}
+    catch
+        error:_ -> false
+    end;
+get_env_name_l([H|T], Acc) ->
+    get_env_name_l(T, [H|Acc]);
+get_env_name_l([], _) ->
+    false.
+
+match_var_b([{K,V}|T], B) ->
+    case re:split(B, "^" ++ K, [{return, binary}]) of
+        [_] ->
+            match_var_b(T, B);
+        [<<>>, Rest] ->
+            {stringify(V()), Rest}
+    end;
+match_var_b([], _) ->
+    false.
 
 env_value("LOG_DIR") -> log_dir();
 env_value("DATA_DIR") -> data_dir();
@@ -340,13 +479,13 @@ env_value("APP", A) -> A;
 env_value("PRIV_DIR", A) -> priv_dir(A);
 env_value("LIB_DIR" , A) -> lib_dir(A).
 
-custom_env_value(_K, {value, V}, _Vs) ->
+custom_env_value(_K, {value, V}, _Vs, _A) ->
     V;
-custom_env_value(_K, {expand, V}, Vs) ->
-    expand_env(Vs, V);
-custom_env_value(K, {apply, M, F, A}, _Vs) ->
+custom_env_value(_K, {expand, V}, Vs, A) ->
+    expand_env(Vs, V, A);
+custom_env_value(K, {apply, M, F, As}, _Vs, _A) ->
     %% Not ideal, but don't want to introduce exceptions in get_env()
-    try apply(M, F, A)
+    try apply(M, F, As)
     catch
         error:_ ->
             {error, {custom_setup_env, K}}
@@ -415,7 +554,7 @@ patch_app(A, Vsn, LibDirs) ->
     case find_app(A, LibDirs) of
         [_|_] = Found ->
             {_ActualVsn, Dir} = pick_vsn(A, Found, Vsn),
-            io:fwrite("[~p vsn ~p] code:add_patha(~s)~n", [A, _ActualVsn, Dir]),
+            error_logger:info_msg("[~p vsn ~p] code:add_patha(~s)~n", [A, _ActualVsn, Dir]),
             code:add_patha(Dir);
         [] ->
             error(no_matching_vsn)
@@ -588,8 +727,8 @@ reload_app(A, ToVsn0, LibDirs) ->
             if ToVsn == FromVsn ->
                     {error, same_version};
                true ->
-                    io:fwrite("[~p vsn ~p] soft upgrade from ~p~n",
-                              [A, ToVsn, FromVsn]),
+                    error_logger:info_msg("[~p vsn ~p] soft upgrade from ~p~n",
+                                          [A, ToVsn, FromVsn]),
                     reload_app(
                       A, FromVsn, filename:join(code:lib_dir(A), "ebin"),
                       NewPath, ToVsn)
@@ -639,8 +778,8 @@ path_entries(A, Path) ->
 make_appup_script(A, OldVsn, NewPath) ->
     {application, _, NewAppTerms} = NewApp =
         read_app(filename:join(NewPath, atom_to_list(A) ++ ".app")),
-    OldAppTerms = application:get_all_key(A),
-    _OldApp = {application, A, OldAppTerms},
+    %% OldAppTerms = application:get_all_key(A),
+    %% _OldApp = {application, A, OldAppTerms},
     case find_script(A, NewPath, OldVsn, up) of
         {NewVsn, Script} ->
             {NewVsn, Script, NewApp};
@@ -719,32 +858,25 @@ intersection(A, B) ->
 %% Afterwards, setup will either finish and leave the system running, or
 %% stop, terminating all nodes automatically.
 %%
-run_setup(Parent, Args) ->
-    io:fwrite("Setup running ...~n", []),
-    try run_setup_(Parent, Args)
+run_setup() ->
+    error_logger:info_msg("Setup running ...~n", []),
+    try run_setup_()
     catch
         error:Error ->
-            io:fwrite("Caught exception:~n"
-                      "~p~n"
-                      "~p~n", [Error, erlang:get_stacktrace()])
+            error_logger:error_msg("Caught exception:~n"
+                                   "~p~n"
+                                   "~p~n", [Error, erlang:get_stacktrace()])
     end.
 
-run_setup_(Parent, _Args) ->
-    Res = rpc:multicall(?MODULE, verify_directories, []),
-    io:fwrite("Directories verified. Res = ~p~n", [Res]),
-    proc_lib:init_ack(Parent, {ok, self()}),
+run_setup_() ->
+    Res = maybe_verify_directories(),
+    error_logger:info_msg("Directories verified. Res = ~p~n", [Res]),
     Mode = mode(),
     Hooks = find_hooks(Mode),
     run_selected_hooks(Hooks),
-    io:fwrite("Setup finished processing hooks ...~n", []),
-    case app_get_env(setup, stop_when_done) of
-        {ok, true} when Mode =/= normal ->
-            io:fwrite("Setup stopping...~n", []),
-            timer:sleep(timer:seconds(5)),
-            rpc:eval_everywhere(init,stop,[0]);
-        _ ->
-            timer:sleep(infinity)
-    end.
+    error_logger:info_msg(
+      "Setup finished processing hooks (Mode=~p)...~n", [Mode]),
+    ok.
 
 %% @spec find_hooks() -> [{PhaseNo, [{M,F,A}]}]
 %% @doc Finds all custom setup hooks in all applications.
@@ -816,7 +948,7 @@ find_hooks_(Mode, A, L, Acc1) ->
                         orddict:append(
                           N, MFA1, Acc3);
                    (Other1, Acc3) ->
-                        io:fwrite(
+                        error_logger:info_msg(
                           "Invalid hook: ~p~n"
                           "  App  : ~p~n"
                           "  Mode : ~p~n"
@@ -838,7 +970,15 @@ mode() ->
         {ok, M} ->
             M;
         _ ->
-            normal
+            case init:get_argument(boot) of
+                {ok, [[Boot]]} ->
+                    case filename:basename(Boot) of
+                        "install" -> setup;
+                        _ -> normal
+                    end;
+                _ ->
+                    normal
+            end
     end.
 
 %% @spec run_hooks() -> ok
@@ -881,14 +1021,14 @@ run_selected_hooks(Hooks) ->
     AbortOnError = case app_get_env(setup, abort_on_error) of
                        {ok, F} when is_boolean(F) -> F;
                        {ok, Other} ->
-                           io:fwrite("Invalid abort_on_error flag (~p)~n"
-                                     "Aborting...~n", [Other]),
+                           error_logger:error_msg("Invalid abort_on_error flag (~p)~n"
+                                                  "Aborting...~n", [Other]),
                            error({invalid_abort_on_error, Other});
                        _ -> false
                    end,
     lists:foreach(
       fun({Phase, MFAs}) ->
-              io:fwrite("Setup phase ~p~n", [Phase]),
+              error_logger:info_msg("Setup phase ~p~n", [Phase]),
               lists:foreach(fun({M, F, A}) ->
                                     try_apply(M, F, A, AbortOnError)
                             end, MFAs)
@@ -911,7 +1051,7 @@ try_apply(M, F, A, Abort) ->
                 {error, {Type, Exception}} ->
                     report_error(Type, Exception, M, F, A),
                     if Abort ->
-                            io:fwrite(
+                            error_logger:error_msg(
                               "Abort on error is set. Terminating sequence~n",[]),
                             error(Exception);
                        true ->
@@ -922,7 +1062,7 @@ try_apply(M, F, A, Abort) ->
 
 report_result(Result, M, F, A) ->
     MFAString = format_mfa(M, F, A),
-    io:fwrite(MFAString ++ "-> ~p~n", [Result]).
+    error_logger:info_msg(MFAString ++ "-> ~p~n", [Result]).
 
 report_error(Type, Error, M, F, A) ->
     ErrTypeStr = case Type of
@@ -931,8 +1071,8 @@ report_error(Type, Error, M, F, A) ->
                      exit  -> "EXIT:  "
                  end,
     MFAString = format_mfa(M, F, A),
-    io:fwrite(MFAString ++ "-> " ++ ErrTypeStr ++ "~p~n~p~n",
-              [Error, erlang:get_stacktrace()]).
+    error_logger:error_msg(MFAString ++ "-> " ++ ErrTypeStr ++ "~p~n~p~n",
+                           [Error, erlang:get_stacktrace()]).
 
 
 format_mfa(M, F, A) ->
@@ -1254,36 +1394,55 @@ try_ebin_dirs([],BundleDir,Tail,Res,_Bundle,Bs) ->
 archive_extension() ->
     init:archive_extension().
 
-
 read_config_script(F, Name, Opts) ->
+    read_config_script(F, Name, [], Opts).
+
+read_config_script(F, Name, Vars, Opts) ->
     Dir = filename:dirname(F),
-    BaseName = filename:basename(F),
-    case file:script(F, script_vars([{'Name', Name},
-                                     {'SCRIPT', BaseName},
+    Absname = filename:absname(F),
+    case file_script(F, script_vars([{'Name', Name},
+                                     {'SCRIPT', Absname},
                                      {'CWD', filename:absname(Dir)},
-                                     {'OPTIONS', Opts}])) of
+                                     {'OPTIONS', Opts} | Vars])) of
         {ok, Conf} when is_list(Conf) ->
-            expand_config_script(Conf, Name, lists:reverse(Opts));
+            expand_config_script(Conf, Name, [], Opts);
         Error ->
             setup_lib:abort("Error reading conf (~s): ~p~n", [F, Error])
     end.
 
-expand_config_script([{include, F}|Opts], Name, Acc) ->
-    Acc1 = read_config_script(F, Name, lists:reverse(Acc)),
-    expand_config_script(Opts, Name, Acc1);
-expand_config_script([{include_lib, LibF}|Opts], Name, Acc) ->
+expand_config_script([{include, F}|T], Name, Acc, Opts) ->
+    Incl = read_config_script(F, Name, [], Opts),
+    expand_config_script(T, Name, [Incl|Acc], Opts);
+expand_config_script([{include, F, Vars}|T], Name, Acc, Opts) ->
+    Incl = read_config_script(F, Name, Vars, Opts),
+    expand_config_script(T, Name, [Incl|Acc], Opts);
+expand_config_script([{include_lib, LibF}|T], Name, Acc, Opts) ->
+    ?if_verbose(io:fwrite("include_lib: ~s~n", [LibF])),
+    expand_include_lib(LibF, [], T, Name, Acc, Opts);
+expand_config_script([{include_lib, LibF, Vars}|T], Name, Acc, Opts) ->
+    ?if_verbose(io:fwrite("include_lib: ~s (~p)~n", [LibF, Vars])),
+    expand_include_lib(LibF, Vars, T, Name, Acc, Opts);
+expand_config_script([H|T], Name, Acc, Opts) ->
+    expand_config_script(T, Name, [H|Acc], Opts);
+expand_config_script([], _, Acc, _) ->
+    lists:flatten(lists:reverse(Acc)).
+
+expand_include_lib(LibF, Vars, T, Name, Acc, Opts) ->
+    Fullname = find_lib_script(LibF),
+    Incl = read_config_script(Fullname, Name, Vars, Opts),
+    expand_config_script(T, Name, [Incl|Acc], Opts).
+
+find_lib_script(LibF) ->
     case filename:split(LibF) of
         [App|Tail] ->
-            try code:lib_dir(to_atom(App)) of
+            ?if_verbose(io:fwrite("lib: ~s~n", [App])),
+            try code_lib_dir(App) of
                 {error, bad_name} ->
                     setup_lib:abort(
                       "Error including conf (~s): no such lib (~s)~n",
                       [LibF, App]);
                 LibDir when is_list(LibDir) ->
-                    FullName = filename:join([LibDir | Tail]),
-                    Acc1 = read_config_script(
-                             FullName, Name, lists:reverse(Acc)),
-                    expand_config_script(Opts, Name, Acc1)
+                    filename:join([LibDir | Tail])
             catch
                 error:_ ->
                     setup_lib:abort(
@@ -1292,24 +1451,101 @@ expand_config_script([{include_lib, LibF}|Opts], Name, Acc) ->
             end;
         [] ->
             setup_lib:abort("Invalid include conf: no file specified~n", [])
+    end.
+
+
+code_lib_dir("setup") ->
+    IsEscript = setup_lib:is_escript(),
+    case IsEscript of
+        true ->
+            filename:dirname(
+              filename:absname(
+                escript:script_name()));
+        false ->
+            code:lib_dir(setup)
     end;
-expand_config_script([H|T], Name, Acc) ->
-    expand_config_script(T, Name, [H|Acc]);
-expand_config_script([], _, Acc) ->
-    lists:reverse(Acc).
+code_lib_dir(App) ->
+    code:lib_dir(App).
 
-to_atom(B) when is_binary(B) ->
-    binary_to_existing_atom(B, latin1);
-to_atom(L) when is_list(L) ->
-    list_to_existing_atom(L).
+%% -- a modified version of file:script/2
+%% -- The main difference: call erl_eval:exprs() with a local_function handler
 
+file_script(File, Bs) ->
+    case file:open(File, [read]) of
+        {ok, Fd} ->
+            R = eval_stream(Fd, return, Bs),
+            _ = file:close(Fd),
+            R;
+        Error ->
+            Error
+    end.
 
+eval_stream(Fd, Handling, Bs) ->
+    _ = epp:set_encoding(Fd),
+    eval_stream(Fd, Handling, 1, undefined, [], Bs).
+
+eval_stream(Fd, H, Line, Last, E, Bs) ->
+    eval_stream2(io:parse_erl_exprs(Fd, '', Line), Fd, H, Last, E, Bs).
+
+eval_stream2({ok,Form,EndLine}, Fd, H, Last, E, Bs0) ->
+    try erl_eval:exprs(Form, Bs0, local_func_handler()) of
+        {value,V,Bs} ->
+            eval_stream(Fd, H, EndLine, {V}, E, Bs)
+    catch Class:Reason ->
+            Error = {EndLine,?MODULE,{Class,Reason,erlang:get_stacktrace()}},
+            eval_stream(Fd, H, EndLine, Last, [Error|E], Bs0)
+    end;
+eval_stream2({error,What,EndLine}, Fd, H, Last, E, Bs) ->
+    eval_stream(Fd, H, EndLine, Last, [What | E], Bs);
+eval_stream2({eof,EndLine}, _Fd, H, Last, E, _Bs) ->
+    case {H, Last, E} of
+        {return, {Val}, []} ->
+            {ok, Val};
+        {return, undefined, E} ->
+            {error, hd(lists:reverse(E, [{EndLine,?MODULE,undefined_script}]))};
+        {ignore, _, []} ->
+            ok;
+        {_, _, [_|_] = E} ->
+            {error, hd(lists:reverse(E))}
+    end.
+
+%% -- end file:script/2 copy-paste
+
+local_func_handler() ->
+    {eval, fun local_func/3}.
+
+local_func(b, [], Bs) ->
+    {value, erl_eval:bindings(Bs), Bs};
+local_func(eval, Params, Bs) ->
+    [F|T] = [erl_parse:normalise(P) || P <- Params],
+    Vars = case T of
+               [] -> [];
+               [Vs] -> Vs
+           end,
+    Absname = filename:absname(F),
+    {value, file_script(F, script_vars(Vars ++ [{'SCRIPT', Absname}|Bs])), Bs};
+local_func(eval_lib, Params, Bs) ->
+    [LibF|T] = [erl_parse:normalise(P) || P <- Params],
+    try find_lib_script(LibF) of
+        Fullname ->
+            Vars = case T of
+                       [] -> [];
+                       [Vs] -> Vs
+                   end,
+            Res = file_script(Fullname, script_vars(
+                                          Vars ++ [{'SCRIPT', Fullname}|Bs])),
+            {value, Res, Bs}
+    catch
+        error:_ ->
+            {value, {error, enoent}, Bs}
+    end;
+local_func(F, A, _) ->
+    erlang:error({script_undef, F, A, []}).
 
 script_vars(Vs) ->
     lists:foldl(fun({K,V}, Acc) ->
                         erl_eval:add_binding(K, V, Acc)
                 end, erl_eval:new_bindings(), Vs).
-
 
 %% Unit tests
 -ifdef(TEST).
@@ -1325,7 +1561,8 @@ setup_test_() ->
      end,
      [
       ?_test(t_find_hooks()),
-      ?_test(t_expand_vars())
+      ?_test(t_expand_vars()),
+      ?_test(t_nested_includes())
      ]}.
 
 t_find_hooks() ->
@@ -1356,17 +1593,40 @@ t_expand_vars() ->
     application:set_env(stdlib, '$setup_vars',
                         [{"MINUS", {apply,erlang,'-',[4,3]}},
                          {"BAR", {value, "bar"}}]),
-    application:set_env(setup, v1, "/$BAR/$PLUS/$MINUS/$FOO"),
+    application:set_env(setup, envy, 17),
+    application:set_env(setup, v1, "/$BAR/$PLUS/$MINUS/$FOO/$env(envy)"),
     application:set_env(setup, v2, {'$value', "$FOO"}),
+    application:set_env(setup, v3, {'$string', "$env(envy)"}),
     application:set_env(stdlib, v1, {'$string', "$FOO"}),
     application:set_env(stdlib, v2, {'$binary', "$FOO"}),
     application:set_env(stdlib, v3, {"$PLUS", "$MINUS", "$BAR"}),
     %% $BAR and $MINUS are not in setup's context
-    {ok, "/$BAR/3/$MINUS/{foo,1}"} = setup:get_env(setup, v1),
+    {ok, "/$BAR/3/$MINUS/{foo,1}/17"} = setup:get_env(setup, v1),
     {ok, {foo,1}} = setup:get_env(setup, v2),
+    {ok, "17"} = setup:get_env(setup, v3),
     {ok, "{foo,1}"} = setup:get_env(stdlib, v1),
     {ok, <<"{foo,1}">>} = setup:get_env(stdlib,v2),
     {ok, {"3", "1", "bar"}} = setup:get_env(stdlib,v3),
     ok.
+
+t_nested_includes() ->
+    to_file_("a.config", [{apps,[kernel,stdlib,setup]},
+                          {env,[{setup,[{a,1}]}]}]),
+    to_file_("b.config", [{include,"a.config"},
+                          {set_env, [{setup, [{a,2}]}]}]),
+    to_file_("c.config", [{include, "b.config"},
+                          {set_env, [{setup, [{a,3}]}]}]),
+    [{apps,[kernel,stdlib,setup]},
+     {env, [{setup, [{a,1}]}]},
+     {set_env, [{setup, [{a,2}]}]},
+     {set_env, [{setup, [{a,3}]}]}] =
+        setup:read_config_script("c.config", nested, []).
+
+to_file_(F, Term) ->
+    {ok, Fd} = file:open(F, [write]),
+    try io:fwrite(Fd, "~p.~n", [Term])
+    after
+        file:close(Fd)
+    end.
 
 -endif.
