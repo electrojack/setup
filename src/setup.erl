@@ -1610,17 +1610,18 @@ t_expand_vars() ->
     ok.
 
 t_nested_includes() ->
-    to_file_("a.config", [{apps,[kernel,stdlib,setup]},
-                          {env,[{setup,[{a,1}]}]}]),
-    to_file_("b.config", [{include,"a.config"},
-                          {set_env, [{setup, [{a,2}]}]}]),
-    to_file_("c.config", [{include, "b.config"},
-                          {set_env, [{setup, [{a,3}]}]}]),
+    FileA = "a.config",
+    FileB = "b.config",
+    FileC = "c.config",
+    to_file_(FileA, [{apps,[kernel,stdlib,setup]}, {env,[{setup,[{a,1}]}]}]),
+    to_file_(FileB, [{include,FileA}, {set_env, [{setup, [{a,2}]}]}]),
+    to_file_(FileC, [{include, FileB}, {set_env, [{setup, [{a,3}]}]}]),
     [{apps,[kernel,stdlib,setup]},
      {env, [{setup, [{a,1}]}]},
      {set_env, [{setup, [{a,2}]}]},
      {set_env, [{setup, [{a,3}]}]}] =
-        setup:read_config_script("c.config", nested, []).
+        setup:read_config_script(FileC, nested, []),
+    lists:foreach(fun file:delete/1, [FileA, FileB, FileC]).
 
 to_file_(F, Term) ->
     {ok, Fd} = file:open(F, [write]),
